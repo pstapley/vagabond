@@ -1,4 +1,4 @@
-name: Firmare CI
+name: Firmware CI
 
 on:
   push:
