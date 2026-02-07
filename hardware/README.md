@@ -1,0 +1,1 @@
+Hardware designs are licensed under CERN-OHL-S v2.
