@@ -10,7 +10,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  firmware-build:
+    name: Firmware Build
     runs-on: ubuntu-latest
 
     steps:
