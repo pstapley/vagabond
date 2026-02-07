@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <stdbool.h>
-#include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "driver/uart.h"
 #include "esp_assert.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -17,6 +18,28 @@
 #define UART_TX_PIN       GPIO_NUM_17
 #define UART_RX_PIN       GPIO_NUM_16
 #define UART_BAUD         57600
+
+#define PIN_NUM_MISO        19
+#define PIN_NUM_MOSI        23
+#define PIN_NUM_CLK         18
+#define FLASH_PIN_NUM_CS    5
+#define IMU_PIN_NUM_CS      21
+
+// --- ICM-42688-P registers (Bank 0) ---
+#define REG_WHO_AM_I      0x75
+#define REG_DEVICE_CONFIG 0x11
+#define REG_PWR_MGMT0     0x4E
+#define REG_GYRO_CONFIG0  0x4F
+#define REG_ACCEL_CONFIG0 0x50
+
+// WHO_AM_I expected for ICM-42688-P
+#define ICM42688_WHO_AM_I  0x75
+#define ICM42688_ID        0x47
+
+#define IMU_SPI_HZ       (2 * 1000 * 1000)   // start slow for bring-up
+static spi_device_handle_t imu_dev;          // keep as a global/static so other code can use it
+
+static const char *TAG = "extflash";
 
 #define MAV_POOL_SIZE 32
 
@@ -39,6 +62,90 @@ static QueueHandle_t s_free_q;
 static QueueHandle_t s_rx_q;
 
 static bool g_armed = false;
+
+void spi_bus_init(void)
+{
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+}
+
+void extflash_init(void) {
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 10 * 1000 * 1000,   // start at 10 MHz; you can go higher later
+        .mode = 0,                            // SPI mode 0 is typical for W25Q
+        .spics_io_num = FLASH_PIN_NUM_CS,
+        .queue_size = 4,
+    };
+
+    spi_device_handle_t flash_dev;
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &flash_dev));
+
+    ESP_LOGI(TAG, "SPI external flash device added");
+
+}
+
+void imu_init(void)
+{
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = IMU_SPI_HZ,
+        .mode = 0,                 // ICM-42688-P uses SPI mode 0
+        .spics_io_num = IMU_PIN_NUM_CS,
+        .queue_size = 4,
+        // .cs_ena_pretrans = 0,
+        // .cs_ena_posttrans = 0,
+    };
+
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &imu_dev));
+    ESP_LOGI(TAG, "SPI IMU device added");
+
+    // Next step: do WHO_AM_I + basic config using imu_dev handle
+}
+
+esp_err_t imu_read_reg(uint8_t reg, uint8_t *data)
+{
+    uint8_t tx[2] = { reg | 0x80, 0x00 }; // read command + dummy
+    uint8_t rx[2] = { 0 };
+
+    spi_transaction_t t = {
+        .length = 16,        // 2 bytes
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+
+    esp_err_t err = spi_device_transmit(imu_dev, &t);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *data = rx[1]; // second byte is the register value
+    return ESP_OK;
+}
+
+void imu_log_whoami(void)
+{
+    uint8_t whoami = 0;
+
+    ESP_ERROR_CHECK(imu_read_reg(ICM42688_WHO_AM_I, &whoami));
+
+    if (whoami == ICM42688_ID) {
+        ESP_LOGI("IMU", "WHO_AM_I = 0x%02X ✅ (ICM-42688 detected)", whoami);
+    }
+    else {
+        ESP_LOGE("IMU",
+                 "Unexpected WHO_AM_I = 0x%02X (expected 0x%02X)",
+                 whoami,
+                 ICM42688_ID);
+    }
+}
+
 
 static void mav_init_queues(void) {
     s_free_q = xQueueCreate(MAV_POOL_SIZE, sizeof(uint16_t));
@@ -272,63 +379,6 @@ static bool send_command_ack(const mavlink_message_t *cmd_msg, uint16_t command,
     return mav_send_msg(&ack, pdMS_TO_TICKS(10));
 }
 
-static void send_camera_information(void)
-{
-    mavlink_message_t out;
-
-    const uint32_t time_boot_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
-    uint8_t vendor_name[32] = {0};
-    uint8_t model_name[32]  = {0};
-
-    snprintf((char*)vendor_name, sizeof(vendor_name), "ESP32 FC");
-    snprintf((char*)model_name,  sizeof(model_name),  "No Camera");
-
-    const uint32_t firmware_version = 0;   // unknown
-    const float focal_length = 0.0f;
-    const float sensor_size_h = 0.0f;
-    const float sensor_size_v = 0.0f;
-    const uint16_t resolution_h = 0;
-    const uint16_t resolution_v = 0;
-    const uint8_t lens_id = 0;
-
-    // Flags: 0 = no camera capabilities
-    const uint32_t flags = 0;
-
-    // Camera definition metadata (optional)
-    const uint16_t cam_definition_version = 0;
-    const char *cam_definition_uri = "";   // empty = none
-
-    // Device IDs (0 is fine for now)
-    const uint8_t gimbal_device_id = 0;
-    const uint8_t camera_device_id = 0;
-
-    mavlink_msg_camera_information_pack(
-        1,
-        MAV_COMP_ID_AUTOPILOT1,
-        &out,
-        time_boot_ms,
-        vendor_name,
-        model_name,
-        firmware_version,
-        focal_length,
-        sensor_size_h,
-        sensor_size_v,
-        resolution_h,
-        resolution_v,
-        lens_id,
-        flags,
-        cam_definition_version,
-        cam_definition_uri,
-        gimbal_device_id,
-        camera_device_id
-    );
-
-    (void)mav_send_msg(&out, pdMS_TO_TICKS(10));
-}
-
-
-
 static void router_task(void *arg) {
     uint16_t idx;
 
@@ -382,6 +432,7 @@ static void router_task(void *arg) {
 }
 
 void app_main(void) {
+    vTaskDelay(pdMS_TO_TICKS(1000)); // let UART init messages finish
     printf("Boot: sending MAVLink heartbeat on UART2 (TX=%d RX=%d) @ %d\n",
            UART_TX_PIN, UART_RX_PIN, UART_BAUD);
 
@@ -391,13 +442,17 @@ void app_main(void) {
 
     mav_tx_init();
 
+    spi_bus_init();
+    extflash_init();
+    imu_init();
+    imu_log_whoami();
 
-    xTaskCreate(heartbeat_task, "hb", 4096, NULL, 1, NULL);
-    xTaskCreate(sys_status_task, "status", 4096, NULL, 1, NULL);
-    xTaskCreate(gps_task, "gps", 4096, NULL, 1, NULL);
-    xTaskCreate(mav_rx_task, "rx", 4096, NULL, 4, NULL);
-    xTaskCreate(mav_tx_task, "tx", 4096, NULL, 4, NULL);
-    xTaskCreate(router_task, "router", 4096, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(heartbeat_task, "hb", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(sys_status_task, "status", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(gps_task, "gps", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(mav_rx_task, "rx", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(mav_tx_task, "tx", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(router_task, "router", 4096, NULL, 3, NULL, 0);
 
     vTaskDelay(pdMS_TO_TICKS(2000));
     send_statustext(MAV_SEVERITY_INFO, "ESP32 FC Online");
