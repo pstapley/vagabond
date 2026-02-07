@@ -1,0 +1,23 @@
+{
+  "folders": [
+    {
+      "name": "Firmware",
+      "path": "firmware"
+    },
+    {
+      "name": "Hardware", 
+      "path": "hardware"
+    },
+    {
+      "name": "Docs",
+      "path": "docs"
+    },
+    {
+      "name": "Root",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "platformio-ide.projectDir": "firmware"
+  }
+}
