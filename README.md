@@ -8,5 +8,5 @@ Status: Early development
 
 Goals:
 - Fully custom hardware
-- ESP-IDF firmware
+- ESP-IDF/FreeRTOS firmware
 - MAVLink support
